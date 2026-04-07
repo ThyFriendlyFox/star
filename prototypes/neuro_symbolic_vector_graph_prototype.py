@@ -14,7 +14,8 @@ classification, sentences with ``<e1>...</e1>`` and ``<e2>...</e2>`` markup.
 **Training policy (phase A):** train the classifier for K epochs, then run symbolic
 graduation on held-out text using model probabilities.
 
-Dependencies: ``torch``, ``numpy``, ``datasets``, ``transformers``.
+Dependencies: ``torch``, ``numpy``, ``datasets``, ``transformers``, ``tqdm`` (live progress;
+use ``--no-progress`` for plain logs).
 
 Example::
 
@@ -35,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from datasets import load_dataset
+from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, BatchEncoding, get_linear_schedule_with_warmup
 
 # =============================================================================
@@ -434,6 +436,7 @@ def train_epochs(
     grad_clip: float,
     num_labels: int,
     seed: int,
+    show_progress: bool = True,
 ) -> Tuple[List[float], List[float], List[float]]:
     random.seed(seed)
     np.random.seed(seed)
@@ -454,13 +457,31 @@ def train_epochs(
     val_accs: List[float] = []
     val_f1s: List[float] = []
 
-    for _ in range(epochs):
+    epoch_bar = tqdm(
+        range(epochs),
+        desc="Training",
+        unit="epoch",
+        disable=not show_progress,
+        dynamic_ncols=True,
+    )
+    for ep in epoch_bar:
         model.train()
         order = list(range(len(train_sentences)))
         random.shuffle(order)
         epoch_loss = 0.0
         n_batches = 0
-        for start in range(0, len(order), batch_size):
+        n_batch_total = max(1, math.ceil(len(order) / batch_size))
+        batch_starts = range(0, len(order), batch_size)
+        batch_bar = tqdm(
+            batch_starts,
+            desc=f"  Epoch {ep + 1}/{epochs} batches",
+            leave=False,
+            unit="batch",
+            total=n_batch_total,
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+        for start in batch_bar:
             idxs = order[start : start + batch_size]
             sents = [train_sentences[i] for i in idxs]
             labs = [train_labels[i] for i in idxs]
@@ -476,7 +497,10 @@ def train_epochs(
             sched.step()
             epoch_loss += float(loss.item())
             n_batches += 1
-        train_losses.append(epoch_loss / max(1, n_batches))
+            if show_progress:
+                batch_bar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{epoch_loss / n_batches:.4f}")
+        avg_tr_loss = epoch_loss / max(1, n_batches)
+        train_losses.append(avg_tr_loss)
 
         metrics = evaluate_classifier(
             model,
@@ -486,9 +510,16 @@ def train_epochs(
             device,
             batch_size,
             num_labels,
+            show_progress=show_progress,
         )
         val_accs.append(metrics["accuracy"])
         val_f1s.append(metrics["macro_f1"])
+        if show_progress:
+            epoch_bar.set_postfix(
+                train_loss=f"{avg_tr_loss:.4f}",
+                val_acc=f"{metrics['accuracy']:.3f}",
+                macro_f1=f"{metrics['macro_f1']:.3f}",
+            )
 
     return train_losses, val_accs, val_f1s
 
@@ -502,11 +533,23 @@ def evaluate_classifier(
     device: torch.device,
     batch_size: int,
     num_labels: int,
+    show_progress: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     y_t: List[int] = []
     y_p: List[int] = []
-    for start in range(0, len(sentences), batch_size):
+    starts = range(0, len(sentences), batch_size)
+    n_ev = max(1, math.ceil(len(sentences) / batch_size))
+    bar = tqdm(
+        starts,
+        desc="  Validation",
+        leave=False,
+        unit="batch",
+        total=n_ev,
+        disable=not show_progress,
+        dynamic_ncols=True,
+    )
+    for start in bar:
         sents = sentences[start : start + batch_size]
         labs = labels[start : start + batch_size]
         batch = collate_for_model(tokenizer, sents, labs, device)
@@ -556,9 +599,23 @@ class NeuroSymbolicTrainer:
         self.embedding_dim = embedding_dim
         self.history: List[Tuple[float, float, int, int]] = []
 
-    def promote_from_sentences(self, sentences: Iterable[str], provenance: str = "graduated") -> int:
+    def promote_from_sentences(
+        self,
+        sentences: Iterable[str],
+        provenance: str = "graduated",
+        show_progress: bool = False,
+    ) -> int:
         promoted = 0
-        for sent in sentences:
+        seq = list(sentences)
+        bar = tqdm(
+            seq,
+            desc="  Graduation",
+            unit="sent",
+            leave=False,
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+        for sent in bar:
             try:
                 cands = self.perceiver.perceive_sentence(
                     sent,
@@ -584,6 +641,8 @@ class NeuroSymbolicTrainer:
                     self.vkb.upsert_node(obj_id, pad, prob=float(prob))
                     self.vkb.add_edge(subj_id, pred.name, obj_id, provenance=provenance)
                 promoted += 1
+            if show_progress:
+                bar.set_postfix(promoted=promoted, thr=f"{self.confidence_threshold:.2f}")
         return promoted
 
     def monitor_overfitting(self) -> None:
@@ -684,6 +743,11 @@ def main() -> None:
     p.add_argument("--init-threshold", type=float, default=0.55)
     p.add_argument("--family-demo", action="store_true", help="add toy family KB for extra forward-chaining demo")
     p.add_argument("--skip-train", action="store_true", help="load model weights only if you add checkpoint support later (not implemented)")
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable tqdm bars (for log files / non-TTY)",
+    )
     args = p.parse_args()
     if args.skip_train:
         raise SystemExit("--skip-train is not supported in this prototype (train real weights first).")
@@ -718,6 +782,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = RelationTransformer(args.model_name, num_labels)
 
+    show_progress = not args.no_progress
     print(
         f"Training on {args.dataset} | train={len(train_text)} eval={len(eval_text)} "
         f"| labels={num_labels} | device={device}"
@@ -737,7 +802,9 @@ def main() -> None:
         grad_clip=args.grad_clip,
         num_labels=num_labels,
         seed=args.seed,
+        show_progress=show_progress,
     )
+    print("Epoch summary (train_loss / val_acc / val_macro_f1):")
     for i, (tl, va, vf) in enumerate(zip(t_losses, v_accs, v_f1s)):
         print(f"  epoch {i + 1}: train_loss={tl:.4f} val_acc={va:.4f} val_macro_f1={vf:.4f}")
 
@@ -765,16 +832,31 @@ def main() -> None:
     grad_sents = eval_text[:grad_cap]
 
     n_before = len(kb.facts)
-    promoted = trainer.promote_from_sentences(grad_sents, provenance="eval_graduation")
+    promoted = trainer.promote_from_sentences(
+        grad_sents, provenance="eval_graduation", show_progress=show_progress
+    )
     derived = inference.forward_chain(max_rounds=24)
     n_facts = len(kb.facts)
 
     train_metrics_end = evaluate_classifier(
-        model, tokenizer, train_text[: min(len(train_text), 2000)], train_labels[: min(len(train_text), 2000)],
-        device, args.batch_size, num_labels,
+        model,
+        tokenizer,
+        train_text[: min(len(train_text), 2000)],
+        train_labels[: min(len(train_text), 2000)],
+        device,
+        args.batch_size,
+        num_labels,
+        show_progress=show_progress,
     )
     val_metrics_end = evaluate_classifier(
-        model, tokenizer, eval_text, eval_labels, device, args.batch_size, num_labels
+        model,
+        tokenizer,
+        eval_text,
+        eval_labels,
+        device,
+        args.batch_size,
+        num_labels,
+        show_progress=show_progress,
     )
     trainer.record_epoch(train_metrics_end["accuracy"], val_metrics_end["accuracy"], n_facts, len(vkb.edges))
     print(
