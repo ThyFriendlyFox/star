@@ -17,15 +17,30 @@ graduation on held-out text using model probabilities.
 Dependencies: ``torch``, ``numpy``, ``datasets``, ``transformers``, ``tqdm`` (live progress;
 use ``--no-progress`` for plain logs).
 
-Example::
+Example (train + save)::
 
     python prototypes/neuro_symbolic_vector_graph_prototype.py \\
-        --epochs 2 --max-train-samples 800 --max-eval-samples 200 --device cpu
+        --epochs 2 --save-checkpoint checkpoints/semeval_re.pt
+
+Try saved weights on new text::
+
+    python prototypes/neuro_symbolic_vector_graph_prototype.py \\
+        --predict-only --load-checkpoint checkpoints/semeval_re.pt \\
+        --infer-sentence 'The <e1>cat</e1> ate the <e2>mouse</e2>.' --device cpu
+
+Inspect the built KB (JSON + Graphviz + rule trace)::
+
+    python prototypes/neuro_symbolic_vector_graph_prototype.py \\
+        --load-checkpoint checkpoints/your.pt --trace-inference \\
+        --export-json out/kb.json --export-dot out/kb.dot \\
+        --query-entity factory
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import random
 import re
@@ -184,17 +199,29 @@ class InferenceEngine:
     def __init__(self, kb: KnowledgeBase):
         self.kb = kb
 
-    def forward_chain(self, max_rounds: int = 32) -> int:
+    def forward_chain(self, max_rounds: int = 32, trace: Optional[List[str]] = None) -> int:
+        """
+        Forward chaining. If ``trace`` is a list, append a human-readable line for each
+        newly derived fact (rule head + which rule body matched).
+        """
         added_total = 0
-        for _ in range(max_rounds):
-            batch: List[Expression] = []
+        for rnum in range(max_rounds):
+            staged: List[Tuple[Expression, str]] = []
             for rule in self.kb.rules:
-                batch.extend(_derive_from_rule(self.kb.facts, rule))
-            if not batch:
+                derived = _derive_from_rule(self.kb.facts, rule)
+                for head_i in derived:
+                    staged.append((head_i, str(rule)))
+            if not staged:
                 break
-            for f in batch:
-                if self.kb.add_fact(f):
+            seen: Set[Expression] = set()
+            for fact, rule_str in staged:
+                if fact in seen:
+                    continue
+                seen.add(fact)
+                if self.kb.add_fact(fact):
                     added_total += 1
+                    if trace is not None:
+                        trace.append(f"round {rnum + 1}: {fact}\n  <- rule {rule_str}")
         return added_total
 
 
@@ -681,6 +708,93 @@ def abstraction_rules(related: Symbol, id2label: Dict[int, str]) -> List[Rule]:
     return rules
 
 
+def _expr_to_serializable(expr: Any) -> Any:
+    if isinstance(expr, Symbol):
+        return {"sym": expr.name}
+    if isinstance(expr, Variable):
+        return {"var": expr.name}
+    if isinstance(expr, tuple):
+        return [_expr_to_serializable(x) for x in expr]
+    return str(expr)
+
+
+def export_kb_bundle(
+    kb: KnowledgeBase,
+    vkb: VectorGraphKB,
+    inference_trace: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Structured snapshot of facts, rules, vector-graph edges, optional inference steps."""
+    facts = [_expr_to_serializable(f) for f in sorted(kb.facts, key=lambda x: str(x))]
+    rules = [
+        {"head": _expr_to_serializable(r.head), "body": [_expr_to_serializable(b) for b in r.body]}
+        for r in kb.rules
+    ]
+    edges = [{"subj": s, "relation": rel, "obj": o, "provenance": prov} for s, rel, o, prov in vkb.edges]
+    nodes_meta = {
+        nid: {"metadata": n.metadata, "embedding_dim": int(n.embedding.shape[0])}
+        for nid, n in vkb.nodes.items()
+    }
+    out: Dict[str, Any] = {
+        "facts": facts,
+        "rules": rules,
+        "graph_edges": edges,
+        "graph_nodes": nodes_meta,
+        "counts": {
+            "facts": len(kb.facts),
+            "rules": len(kb.rules),
+            "edges": len(vkb.edges),
+            "nodes": len(vkb.nodes),
+        },
+    }
+    if inference_trace:
+        out["inference_trace"] = inference_trace
+    return out
+
+
+def write_kb_json(path: str, bundle: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(bundle, f, indent=2)
+    print(f"Wrote JSON export: {path}")
+
+
+def stable_graph_id(label: str) -> str:
+    return "n_" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+
+
+def write_relation_graph_dot(path: str, kb: KnowledgeBase, vkb: VectorGraphKB) -> None:
+    """Graphviz DOT for grounded (predicate, subj, obj) facts. Render: ``dot -Tsvg out.dot -o out.svg``."""
+    lines = [
+        "digraph neuro_symbolic_kb {",
+        "  rankdir=LR;",
+        "  node [shape=box, fontname=Helvetica, fontsize=10];",
+        "  edge [fontname=Helvetica, fontsize=8];",
+    ]
+    declared: Set[str] = set()
+    for fact in kb.facts:
+        if len(fact) != 3:
+            continue
+        pred, subj, obj = fact
+        if not (_is_sym(pred) and _is_sym(subj) and _is_sym(obj)):
+            continue
+        sid, oid = stable_graph_id(subj.name), stable_graph_id(obj.name)
+        for gid, glabel in (sid, subj.name), (oid, obj.name):
+            if gid not in declared:
+                declared.add(gid)
+                lab = glabel.replace("\\", "\\\\").replace('"', '\\"')[:100]
+                lines.append(f'  {gid} [label="{lab}"];')
+        pl = pred.name.replace("\\", "\\\\").replace('"', '\\"')[:120]
+        lines.append(f'  {sid} -> {oid} [label="{pl}"];')
+    lines.append("}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Wrote Graphviz DOT: {path}  (example: dot -Tsvg {path} -o graph.svg)")
+
+
+def filter_facts_by_entity(kb: KnowledgeBase, needle: str) -> List[Expression]:
+    needle_l = needle.lower()
+    return [fact for fact in kb.facts if needle_l in str(fact).lower()]
+
+
 def optional_family_seed(kb: KnowledgeBase) -> None:
     """Small disjoint demo: family rules + facts (symbol namespaced with fam_)."""
     A, B, C, D = Symbol("fam_Alice"), Symbol("fam_Bob"), Symbol("fam_Carol"), Symbol("fam_Dave")
@@ -722,6 +836,66 @@ def build_id2label_from_features(train_ds: Any, label_field: str = "relation") -
     return {i: feat.int2str(i) for i in range(n)}
 
 
+def save_relation_checkpoint(
+    path: str,
+    model: RelationTransformer,
+    model_name: str,
+    id2label: Dict[int, str],
+) -> None:
+    """Save encoder+classifier weights plus label map for later --load-checkpoint / --predict-only."""
+    payload = {
+        "format": "neuro_symbolic_prototype_v1",
+        "model_name": model_name,
+        "id2label": {str(k): v for k, v in sorted(id2label.items())},
+        "state_dict": model.state_dict(),
+    }
+    torch.save(payload, path)
+    meta_path = path + ".json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"model_name": model_name, "id2label": payload["id2label"]}, f, indent=2)
+    print(f"Wrote checkpoint: {path} (metadata: {meta_path})")
+
+
+def load_relation_checkpoint(
+    path: str,
+    device: torch.device,
+) -> Tuple[RelationTransformer, Dict[int, str], str]:
+    try:
+        payload = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
+    if not isinstance(payload, dict) or "state_dict" not in payload:
+        raise ValueError(f"not a prototype checkpoint: {path}")
+    model_name = str(payload["model_name"])
+    id2label = {int(k): str(v) for k, v in payload["id2label"].items()}
+    num_labels = len(id2label)
+    model = RelationTransformer(model_name, num_labels)
+    model.load_state_dict(payload["state_dict"], strict=True)
+    model.to(device)
+    model.eval()
+    return model, id2label, model_name
+
+
+def run_predict_only(
+    checkpoint_path: str,
+    sentences: List[str],
+    device: torch.device,
+    top_k: int,
+) -> None:
+    model, id2label, model_name = load_relation_checkpoint(checkpoint_path, device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    perceiver = NeuralPerceiver(model, tokenizer, id2label, device)
+    for sent in sentences:
+        print(f"\nSentence: {sent[:120]}{'…' if len(sent) > 120 else ''}")
+        try:
+            cands = perceiver.perceive_sentence(sent, top_k=top_k, min_prob=0.0)
+        except ValueError as e:
+            print(f"  (skip: {e})")
+            continue
+        for expr, prob, _ in cands:
+            print(f"  p={prob:.4f}  {expr}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default="SemEvalWorkshop/sem_eval_2010_task_8")
@@ -742,15 +916,79 @@ def main() -> None:
     p.add_argument("--max-grad-sentences", type=int, default=500, help="cap sentences scanned for graduation")
     p.add_argument("--init-threshold", type=float, default=0.55)
     p.add_argument("--family-demo", action="store_true", help="add toy family KB for extra forward-chaining demo")
-    p.add_argument("--skip-train", action="store_true", help="load model weights only if you add checkpoint support later (not implemented)")
+    p.add_argument(
+        "--save-checkpoint",
+        default="",
+        metavar="PATH",
+        help="after training, save weights + label map here (.pt)",
+    )
+    p.add_argument(
+        "--load-checkpoint",
+        default="",
+        metavar="PATH",
+        help="load weights; skip training (still runs eval/graduation unless --predict-only)",
+    )
+    p.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="with --load-checkpoint and --infer-sentence: print predictions and exit (no HF dataset)",
+    )
+    p.add_argument(
+        "--infer-sentence",
+        nargs="+",
+        default=[],
+        metavar="TEXT",
+        help="SemEval-style sentence with <e1>...</e1> and <e2>...</e2>; use with --predict-only",
+    )
+    p.add_argument("--predict-top-k", type=int, default=5, help="top softmax labels to print in --predict-only")
+    p.add_argument(
+        "--export-json",
+        default="",
+        metavar="PATH",
+        help="after graduation, write facts/rules/graph (+ optional trace) as JSON",
+    )
+    p.add_argument(
+        "--export-dot",
+        default="",
+        metavar="PATH",
+        help="after graduation, write relation graph as Graphviz DOT (entity nodes, predicate edge labels)",
+    )
+    p.add_argument(
+        "--trace-inference",
+        action="store_true",
+        help="print (and include in --export-json) each forward-chaining step: fact <- rule",
+    )
+    p.add_argument(
+        "--query-entity",
+        default="",
+        metavar="SUBSTRING",
+        help="after graduation, print facts whose text contains this substring (case-insensitive)",
+    )
     p.add_argument(
         "--no-progress",
         action="store_true",
         help="disable tqdm bars (for log files / non-TTY)",
     )
     args = p.parse_args()
-    if args.skip_train:
-        raise SystemExit("--skip-train is not supported in this prototype (train real weights first).")
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit(
+            "Requested --device cuda, but this PyTorch build has no CUDA (CPU-only wheel).\n"
+            "  Fix now: rerun with --device cpu\n"
+            "  Fix GPU: install a CUDA-enabled torch from https://pytorch.org/get-started/locally/ "
+            "into this venv, then use --device cuda."
+        )
+
+    if args.predict_only:
+        if __debug__:
+            _self_test()
+        if not args.load_checkpoint:
+            raise SystemExit("--predict-only requires --load-checkpoint PATH")
+        if not args.infer_sentence:
+            raise SystemExit("--predict-only requires at least one --infer-sentence ...")
+        run_predict_only(args.load_checkpoint, args.infer_sentence, device, top_k=args.predict_top_k)
+        return
 
     if __debug__:
         _self_test()
@@ -768,45 +1006,62 @@ def main() -> None:
     train_text, train_labels = subset_examples(train_text, train_labels, m_tr)
     eval_text, eval_labels = subset_examples(eval_text, eval_labels, m_ev)
 
-    id2label = build_id2label_from_features(train_ds, lab_f)
-    num_labels = len(id2label)
+    id2label_ds = build_id2label_from_features(train_ds, lab_f)
+    num_labels_ds = len(id2label_ds)
 
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise SystemExit(
-            "Requested --device cuda, but this PyTorch build has no CUDA (CPU-only wheel).\n"
-            "  Fix now: rerun with --device cpu\n"
-            "  Fix GPU: install a CUDA-enabled torch from https://pytorch.org/get-started/locally/ "
-            "into this venv, then use --device cuda."
-        )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = RelationTransformer(args.model_name, num_labels)
+    encoder_model_name = args.model_name
+    if args.load_checkpoint:
+        model, id2label, encoder_model_name = load_relation_checkpoint(args.load_checkpoint, device)
+        tokenizer = AutoTokenizer.from_pretrained(encoder_model_name)
+        num_labels = len(id2label)
+        if num_labels != num_labels_ds:
+            print(
+                f"Warning: checkpoint num_labels={num_labels} vs dataset={num_labels_ds} "
+                "(using checkpoint)."
+            )
+    else:
+        id2label = id2label_ds
+        num_labels = num_labels_ds
+        tokenizer = AutoTokenizer.from_pretrained(encoder_model_name)
+        model = RelationTransformer(encoder_model_name, num_labels)
 
     show_progress = not args.no_progress
     print(
         f"Training on {args.dataset} | train={len(train_text)} eval={len(eval_text)} "
         f"| labels={num_labels} | device={device}"
     )
-    t_losses, v_accs, v_f1s = train_epochs(
-        model,
-        tokenizer,
-        train_text,
-        train_labels,
-        eval_text,
-        eval_labels,
-        device,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        grad_clip=args.grad_clip,
-        num_labels=num_labels,
-        seed=args.seed,
-        show_progress=show_progress,
-    )
-    print("Epoch summary (train_loss / val_acc / val_macro_f1):")
-    for i, (tl, va, vf) in enumerate(zip(t_losses, v_accs, v_f1s)):
-        print(f"  epoch {i + 1}: train_loss={tl:.4f} val_acc={va:.4f} val_macro_f1={vf:.4f}")
+    if args.load_checkpoint:
+        print("(Skipping training: loaded --load-checkpoint.)")
+        t_losses, v_accs, v_f1s = [], [], []
+    else:
+        t_losses, v_accs, v_f1s = train_epochs(
+            model,
+            tokenizer,
+            train_text,
+            train_labels,
+            eval_text,
+            eval_labels,
+            device,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            grad_clip=args.grad_clip,
+            num_labels=num_labels,
+            seed=args.seed,
+            show_progress=show_progress,
+        )
+        print("Epoch summary (train_loss / val_acc / val_macro_f1):")
+        for i, (tl, va, vf) in enumerate(zip(t_losses, v_accs, v_f1s)):
+            print(f"  epoch {i + 1}: train_loss={tl:.4f} val_acc={va:.4f} val_macro_f1={vf:.4f}")
+
+    if args.save_checkpoint:
+        save_relation_checkpoint(
+            args.save_checkpoint,
+            model,
+            encoder_model_name,
+            id2label,
+        )
 
     hidden = model.encoder.config.hidden_size
     kb = KnowledgeBase()
@@ -835,8 +1090,16 @@ def main() -> None:
     promoted = trainer.promote_from_sentences(
         grad_sents, provenance="eval_graduation", show_progress=show_progress
     )
-    derived = inference.forward_chain(max_rounds=24)
+    inf_trace: Optional[List[str]] = [] if args.trace_inference else None
+    derived = inference.forward_chain(max_rounds=24, trace=inf_trace)
     n_facts = len(kb.facts)
+    if inf_trace:
+        cap = 50
+        print(f"Inference trace ({len(inf_trace)} new facts derived; showing up to {cap}):")
+        for line in inf_trace[:cap]:
+            print(line)
+        if len(inf_trace) > cap:
+            print(f"  ... ({len(inf_trace) - cap} more lines; use --export-json with --trace-inference for full trace)")
 
     train_metrics_end = evaluate_classifier(
         model,
@@ -868,6 +1131,17 @@ def main() -> None:
     print("Sample symbolic facts (first 5):")
     for f in demo_queries:
         print(f"  {f}")
+
+    if args.export_json:
+        bundle = export_kb_bundle(kb, vkb, inference_trace=inf_trace)
+        write_kb_json(args.export_json, bundle)
+    if args.export_dot:
+        write_relation_graph_dot(args.export_dot, kb, vkb)
+    if args.query_entity:
+        hits = filter_facts_by_entity(kb, args.query_entity)
+        print(f"Facts matching {args.query_entity!r} ({len(hits)} found, showing up to 40):")
+        for f in hits[:40]:
+            print(f"  {f}")
 
     if vkb.nodes:
         any_id = next(iter(vkb.nodes))
