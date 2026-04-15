@@ -92,13 +92,10 @@ class FusionTransformer(nn.Module):
             dropout=cfg.dropout,
             batch_first=True,
             activation="gelu",
-            norm_first=True,
+            norm_first=False,
         )
         enc = nn.TransformerEncoder(layer, num_layers=cfg.num_fusion_layers)
         enc.enable_nested_tensor = False
-        for lyr in getattr(enc, "layers", []):
-            if hasattr(lyr, "enable_nested_tensor"):
-                lyr.enable_nested_tensor = False
         self.encoder = enc
         self.vision_proj = nn.Linear(cfg.vision_dim, cfg.d_model)
         self.norm = nn.LayerNorm(cfg.d_model)

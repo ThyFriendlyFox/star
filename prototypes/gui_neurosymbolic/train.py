@@ -77,6 +77,17 @@ def train() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA was requested (--device cuda) but this PyTorch build has no CUDA "
+            "(torch.cuda.is_available() is False).\n"
+            "On Google Colab: Runtime → Change runtime type → GPU (T4), then avoid "
+            "`pip install torch` without the CUDA wheel index — it often replaces "
+            "Colab's GPU build with a CPU-only wheel.\n"
+            "Install extras with: pip install onnx\n"
+            "Or train on CPU: --device cpu"
+        )
+
     device = torch.device(args.device)
     use_amp = device.type == "cuda" and not args.no_amp
 
