@@ -1,0 +1,4 @@
+# Optional: prototypes/desktop_intent_recorder.py (screen capture + input + LLM annotate)
+mss>=9.0
+pynput>=1.7.6
+openai>=1.0

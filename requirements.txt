@@ -1,8 +1,19 @@
+# Tkinter (prototypes/gui_neurosymbolic/infer_gui.py):
+# - Debian/Ubuntu: sudo apt install python3-tk
+# - macOS (Homebrew): base python@3.x often has no _tkinter until you install the matching add-on:
+#     brew install python-tk@3.14
+#   Use the same @ version as `brew list | grep python` / your venv’s interpreter. After upgrading
+#   Python, reinstall the matching python-tk@… formula. Verify: python3 -m tkinter
+#
+# Desktop session recorder + LLM (optional): pip install -r requirements_desktop.txt
+#
 torch>=2.0,<3
 torchvision>=0.15
-onnx>=1.16
 numpy>=1.24
+pillow>=9.5
+onnx>=1.16
 datasets>=2.14
+huggingface_hub>=0.20.0
 transformers>=4.36
 tqdm>=4.66
 networkx>=3.0

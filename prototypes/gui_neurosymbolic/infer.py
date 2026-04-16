@@ -6,6 +6,8 @@ Example::
 
     .venv/bin/python prototypes/gui_neurosymbolic/infer.py --checkpoint out/gui_ns.pt \\
         --image path/to.png --task "click submit"
+
+Paths with spaces must be quoted, e.g. ``--image "prototypes/Screenshot 2026-04-15 at 21.59.56.png"``.
 """
 
 from __future__ import annotations
@@ -20,13 +22,13 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import numpy as np
 import torch
-from torchvision.io import read_image
-from torchvision.transforms.functional import resize
+from PIL import Image
 
 from prototypes.gui_neurosymbolic.config import ModelConfig
 from prototypes.gui_neurosymbolic.dataset import task_text_to_ids
-from prototypes.gui_neurosymbolic.model import GUILiteNeuroSymbolicModel, build_model
+from prototypes.gui_neurosymbolic.model import build_model
 from prototypes.gui_neurosymbolic.symbolic_planner import (
     SymbolicPlanner,
     neural_logits_to_action_dict,
@@ -34,11 +36,10 @@ from prototypes.gui_neurosymbolic.symbolic_planner import (
 
 
 def load_image(path: str, size: int) -> torch.Tensor:
-    t = read_image(path).float() / 255.0
-    if t.shape[0] == 1:
-        t = t.repeat(3, 1, 1)
-    t = resize(t, [size, size], antialias=True)
-    return t
+    """RGB float tensor [3, size, size] in [0, 1] (PIL + NumPy; no torchvision)."""
+    img = Image.open(path).convert("RGB").resize((size, size), Image.BILINEAR)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,11 +58,15 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     cfg = ModelConfig()
-    model, _ = build_model(cfg)
     if args.checkpoint:
         ck = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        if isinstance(ck, dict) and "cfg" in ck and isinstance(ck["cfg"], dict):
+            cfg = ModelConfig(**ck["cfg"])
         sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+        model, _ = build_model(cfg)
         model.load_state_dict(sd)
+    else:
+        model, _ = build_model(cfg)
     model.to(device)
     model.eval()
 

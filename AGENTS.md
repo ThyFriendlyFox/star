@@ -9,6 +9,7 @@ This is a Python ML research project (no web server, no database, no Docker). Al
 - **Graph Transformer training:** `python3 train.py --steps 500 --device cpu` (use fewer `--steps` for quick tests; the overfit sanity check runs first by default and takes ~30s on CPU)
 - **Neuro-symbolic prototype:** `python3 prototypes/neuro_symbolic_vector_graph_prototype.py --epochs 1 --device cpu --no-progress` (requires internet on first run to download `distilbert-base-uncased` and `SemEvalWorkshop/sem_eval_2010_task_8` from Hugging Face Hub; add `--max-train-samples 200 --max-eval-samples 100` for a faster test)
 - **KB graph viewer:** `python3 prototypes/view_kb_graph.py out/kb.json --out out/preview.png` (requires a prior prototype run that exported `out/kb.json`)
+- **GUI inference preview (`infer_gui.py`):** requires Tkinter. On **macOS with Homebrew Python**, install the matching Tk add-on once (e.g. for 3.14): `brew install python-tk@3.14`, then verify with `python3 -m tkinter`. See comments at the top of `requirements.txt`.
 
 ### Caveats
 

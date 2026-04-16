@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Train GUI lite neuro-symbolic model on synthetic data (overfit sanity) or real datasets later.
+Train GUI lite neuro-symbolic model on synthetic data (overfit sanity) or PSAI real screenshots.
 
-Example::
+Examples::
 
     .venv/bin/python prototypes/gui_neurosymbolic/train.py --epochs 3 --device cpu --batch-size 8
+
+    .venv/bin/python prototypes/gui_neurosymbolic/train.py --epochs 2 --device cpu --data-source psai \\
+        --train-samples 64 --eval-samples 16 --batch-size 4
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ if str(_ROOT) not in sys.path:
 import torch
 import torch.nn as nn
 from torch import amp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from prototypes.gui_neurosymbolic.config import ModelConfig
 from prototypes.gui_neurosymbolic.dataset import (
@@ -31,6 +34,7 @@ from prototypes.gui_neurosymbolic.dataset import (
     SyntheticGUIDataset,
     collate_batch,
 )
+from prototypes.gui_neurosymbolic.psai_dataset import PSAIComputerUseDataset
 from prototypes.gui_neurosymbolic.losses import multi_task_loss, planner_consistency_loss
 from prototypes.gui_neurosymbolic.model import build_model
 from prototypes.gui_neurosymbolic.symbolic_planner import SymbolicPlanner
@@ -78,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         choices=("structured", "random"),
         default="structured",
         help="structured: deterministic labels from index (learnable); random: i.i.d. noise",
+    )
+    p.add_argument(
+        "--data-source",
+        choices=("synthetic", "psai"),
+        default="synthetic",
+        help="synthetic: local structured/random data; psai: Hugging Face computer-use-data-psai (real screenshots).",
     )
     p.add_argument("--thought-weight", type=float, default=0.08)
     p.add_argument("--bbox-weight", type=float, default=0.35)
@@ -181,7 +191,22 @@ def train() -> None:
         raise RuntimeError(f"Model has {n_params} params, budget {cfg.max_param_budget}")
     model.to(device)
 
-    if args.data_mode == "structured":
+    if args.data_source == "psai":
+        # One pass over the Hub stream: buffer train+eval together, then slice.
+        nbuf = args.train_samples if args.eval_on_train else (
+            args.train_samples + args.eval_samples
+        )
+        full_psai = PSAIComputerUseDataset(cfg, nbuf, skip=0)
+        m = len(full_psai)
+        if args.eval_on_train:
+            train_ds = full_psai
+            eval_ds = full_psai
+        else:
+            t_end = min(args.train_samples, m)
+            e_end = min(args.train_samples + args.eval_samples, m)
+            train_ds = Subset(full_psai, range(0, t_end))
+            eval_ds = Subset(full_psai, range(t_end, e_end))
+    elif args.data_mode == "structured":
         train_ds = StructuredSyntheticGUIDataset(
             cfg,
             args.train_samples,
@@ -205,6 +230,14 @@ def train() -> None:
         eval_ds = train_ds if args.eval_on_train else SyntheticGUIDataset(
             cfg, args.eval_samples, seed=args.seed + 1
         )
+    if len(train_ds) == 0:
+        raise SystemExit(
+            "Training dataset is empty. For --data-source psai, check network access to "
+            "Hugging Face and that streamed rows contain screenshots and at least one "
+            "click in events."
+        )
+    if len(eval_ds) == 0:
+        raise SystemExit("Eval dataset is empty.")
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
