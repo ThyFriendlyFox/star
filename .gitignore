@@ -1,4 +1,6 @@
 /checkpoints/
+.venv-tools/
 __pycache__/
 *.py[cod]
 /out/screen_sessions/
+prototypes/computer-use

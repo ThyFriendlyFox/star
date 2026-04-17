@@ -4,6 +4,8 @@
 
 This is a Python ML research project (no web server, no database, no Docker). All scripts run as standalone Python commands on CPU by default.
 
+**Training Hub (draft product spec):** See [`docs/TRAINING_HUB_PRODUCT.md`](docs/TRAINING_HUB_PRODUCT.md) for a local-first training control plane concept (Colab + Vertex + Hugging Face publish, agent API parity, auto-research ecosystem). Not implemented in this repo unless/until added.
+
 ### Running the scripts
 
 - **Graph Transformer training:** `python3 train.py --steps 500 --device cpu` (use fewer `--steps` for quick tests; the overfit sanity check runs first by default and takes ~30s on CPU)
@@ -17,3 +19,9 @@ This is a Python ML research project (no web server, no database, no Docker). Al
 - The neuro-symbolic prototype downloads ~250 MB of model weights on first run; subsequent runs use the Hugging Face cache.
 - Use `--no-progress` flag on the prototype when running in non-TTY environments to avoid tqdm rendering issues.
 - Matplotlib backend should be `Agg` (non-interactive) when running headless; `view_kb_graph.py` handles this automatically unless `--show` is passed.
+
+### Local agent tools (optional)
+
+- **Colab notebook CLI (community, not Google):** The PyPI package `colab-cli` provides the `colab-cli` command (push/pull/open `.ipynb` with Google Colab via PyDrive; needs OAuth `client_secrets.json` from Google Cloud Console — see `colab-cli set-config --help`). Install into an isolated venv: `python3 -m venv .venv-tools && .venv-tools/bin/pip install -r tools/requirements-tools.txt`, then run `.venv-tools/bin/colab-cli --help`. `GitPython` is listed explicitly because `colab-cli` imports `git` but does not always pull that dependency in cleanly.
+- **Google Cloud / Colab Enterprise:** For official `gcloud colab` (runtimes, schedules, Enterprise), install the [Google Cloud SDK](https://cloud.google.com/sdk) and authenticate; it is separate from consumer colab.research.google.com notebooks.
+- **Cursor Colab MCP:** The `colab-proxy-mcp` server exposes `open_colab_browser_connection` for browser-linked Colab sessions when that integration is enabled.

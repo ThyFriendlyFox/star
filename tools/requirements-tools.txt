@@ -1,0 +1,4 @@
+# Optional local CLIs for agents / developers (not used by train.py).
+# Create venv: python3 -m venv .venv-tools && .venv-tools/bin/pip install -r tools/requirements-tools.txt
+colab-cli>=2.2.5
+GitPython>=3.1.0
